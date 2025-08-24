@@ -30,7 +30,7 @@ public:
         return simOffset + simElapsed;
     }
 
-    void sleep_until_sim(std::chrono::seconds target) {
+    void simSleepUntil(std::chrono::seconds target) {
         std::chrono::seconds cur = simNow();
         if (target <= cur) return;
         // compute required real sleep using inverse of speed
@@ -40,12 +40,23 @@ public:
         );
         std::this_thread::sleep_for(real_wait);
     }
+
+    int simGetCurHour() {
+        int now = std::chrono::duration_cast<std::chrono::hours>(simNow()).count() % 24;
+        return now;
+    }
+
+    int simGetHourFromSecs(std::chrono::seconds seconds) {
+        int hour = std::chrono::duration_cast<std::chrono::hours>(seconds).count() % 24;
+        return hour;
+    }
 };
 
 struct TrafficLightData {
-std::chrono::seconds seconds;
-int trafficLightID;
-int carsPassed;
+    bool signalReport;
+    std::chrono::seconds seconds;
+    int trafficLightID;
+    int carsPassed;
 };
 
 static inline bool parse_hms_to_seconds(const std::string& s, std::chrono::seconds& out) {
@@ -86,6 +97,7 @@ std::vector<TrafficLightData> readFromCSV(std::string fileName) {
         carsPassed = std::stoi(temp); // 3
 
         TrafficLightData data {
+            false,
             seconds,
             trafficLightID,
             carsPassed
@@ -113,7 +125,24 @@ class Buffer {
             std::unique_lock<std::mutex> lock(queueLock);
             notFull.wait(lock, [this]() {return queue.size() < maxSize; });
             queue.push(entry);
+            // printAll();
             notEmpty.notify_one();
+        }
+
+        void printAll() {
+            std::unique_lock<std::mutex> lock(queueLock);
+            std::queue<TrafficLightData> copy = queue;  // make a copy so we don't disturb order
+
+            std::cout << "Buffer contents (" << copy.size() << " items):\n";
+            while (!copy.empty()) {
+                const auto &e = copy.front();
+                int h = std::chrono::duration_cast<std::chrono::hours>(e.seconds).count() % 24;
+                std::cout << "Hour=" << h
+                        << " ID=" << e.trafficLightID
+                        << " Cars=" << e.carsPassed
+                        << "\n";
+                copy.pop();
+            }
         }
 
         TrafficLightData dequeue() {
@@ -131,7 +160,7 @@ class SortedTrafficList {
         int topN;
 
         // hours are 0 - 23
-        std::unordered_map<int, std::unordered_map<int, int>> counts; // hour -> <id -> count>
+        std::unordered_map<int, int> idCounts; // <id -> count>
         std::mutex listLock;
 
     public:
@@ -140,31 +169,40 @@ class SortedTrafficList {
         }
 
         void add(TrafficLightData entry) {
+            std::this_thread::sleep_for(std::chrono::seconds(2)); // simulate work needed to consume
             int hour = std::chrono::duration_cast<std::chrono::hours>(entry.seconds).count() % 24;
             {
                 std::lock_guard<std::mutex> lock(listLock);
-                counts[hour][entry.trafficLightID] += entry.carsPassed;
+                idCounts[entry.trafficLightID] += entry.carsPassed;
             }
-            // std::cout << "Added: (Hour, ID, count) " << hour << " " << entry.trafficLightID << " " << entry.carsPassed << std::endl;
-            // printState();
-            std::this_thread::sleep_for(std::chrono::seconds(2)); // simulate work needed to consume
+            std::this_thread::sleep_for(std::chrono::seconds(3)); // simulate work needed to consume
         }
 
-        void printState() {
-            std::cout << "Current counts:\n";
-            for (const auto &hourPair : counts) {
-                int hour = hourPair.first;
-                for (const auto &idPair : hourPair.second) {
-                    int id = idPair.first;
-                    int count = idPair.second;
-                    std::cout << "(Hour=" << hour
-                            << ", ID=" << id
-                            << ", Count=" << count << ")\n";
-                }
+        void report() {
+            std::lock_guard<std::mutex> lock(listLock);
+
+            // Copy data into vector
+            std::vector<std::pair<int,int>> counts(idCounts.begin(), idCounts.end());
+
+            // Sort descending by count
+            std::sort(counts.begin(), counts.end(),
+                    [](auto &a, auto &b) {
+                        return a.second > b.second;
+                    });
+
+            // Print topN or all
+            int limit = std::min(topN, (int)counts.size());
+            for (int i = 0; i < limit; i++) {
+                std::cout << "(ID=" << counts[i].first
+                        << ", Count=" << counts[i].second << ")\n";
             }
+
+            clear();
         }
 
-
+        void clear() {
+            idCounts = {};
+        }
 };
 
 struct ProducerArgs {
@@ -172,48 +210,57 @@ struct ProducerArgs {
     int assignedID;
     Buffer* buffer;
     SimulationClock* clock;
-    };
+};
 
-    void* ProducerTask(void* threadArgs) {
+void* ProducerTask(void* threadArgs) {
     auto* args = static_cast<ProducerArgs*>(threadArgs);
 
     for (auto& entry : *(args->data)) {
         if (entry.trafficLightID != args->assignedID) continue;
 
         // only enqueue if timestamp matches simulation time :)
-        args->clock->sleep_until_sim(entry.seconds);
+        args->clock->simSleepUntil(entry.seconds);
 
         args->buffer->enqueue(entry);
+        std::cout << "Enqueue at sim t=" << args->clock->simNow().count() << "s\n";
     }
     return nullptr;
-    }
+}
 
-    struct ConsumerArgs {
+struct ConsumerArgs {
     Buffer* buffer;
     SortedTrafficList* list;
     int n;
-    };
+    SimulationClock* clock;
+};
 
-    void* ConsumerTask(void* threadArgs) {
+void* ConsumerTask(void* threadArgs) {
     auto* args = static_cast<ConsumerArgs*>(threadArgs);
     TrafficLightData entry; // process an entry at a time
 
     while (true) {
         entry = args->buffer->dequeue();
+
+        if (entry.signalReport == true) {
+            args->list->report();
+            continue; // no need to add it
+        }
+
         args->list->add(entry);
     }
-    };
+};
 
 
-    int main() { // act as timer thread
+int main() { // act as timer thread
     std::string fileName = "traffic_6h_random.csv";
     std::vector<TrafficLightData> data = readFromCSV(fileName);
     Buffer buffer {1};
     SortedTrafficList list{3}; // shows top 3
     SimulationClock clock{std::chrono::seconds {10 * 3600}, 60.0}; // start at 10am and run at 60x
 
-    int numProducers = 1;
-    int numConsumers = 1;
+    int numProducers = 4;
+    int numTrafficLights = 4;
+    int numConsumers = 2;
 
     std::vector<pthread_t> producers(numProducers);
     std::vector<ProducerArgs> producerArgs(numProducers);
@@ -227,11 +274,26 @@ struct ProducerArgs {
     }
 
     for (int i = 0; i < numConsumers; i++) {
-        consumerArgs[i] = {&buffer, &list, 3};
+        consumerArgs[i] = {&buffer, &list, 3, &clock};
         pthread_create(&consumers[i], nullptr, ConsumerTask, &consumerArgs[i]);
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(60)); // simulate work needed to consume
+    std::cout << "Program Starting" << std::endl;
+
+    while(true) {
+        std::this_thread::sleep_for(std::chrono::seconds(60));
+
+        TrafficLightData signalReport {
+            true,
+            std::chrono::seconds {0},
+            1, // system will at least have 1 traffic light
+            0 // adding 0 will not affect report
+        };
+
+        std::cout << "Enqueued Report Signal" << std::endl;
+
+        buffer.enqueue(signalReport);
+    }
 
     return 0;
 }
