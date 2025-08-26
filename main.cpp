@@ -170,7 +170,6 @@ class SortedTrafficList {
 
         void add(TrafficLightData entry) {
             std::this_thread::sleep_for(std::chrono::seconds(2)); // simulate work needed to consume
-            int hour = std::chrono::duration_cast<std::chrono::hours>(entry.seconds).count() % 24;
             {
                 std::lock_guard<std::mutex> lock(listLock);
                 idCounts[entry.trafficLightID] += entry.carsPassed;
@@ -207,7 +206,7 @@ class SortedTrafficList {
 
 struct ProducerArgs {
     std::vector<TrafficLightData>* data;
-    int assignedID;
+    std::vector<int> assignedIDs;
     Buffer* buffer;
     SimulationClock* clock;
 };
@@ -216,13 +215,21 @@ void* ProducerTask(void* threadArgs) {
     auto* args = static_cast<ProducerArgs*>(threadArgs);
 
     for (auto& entry : *(args->data)) {
-        if (entry.trafficLightID != args->assignedID) continue;
 
+        // skip if traffic light id on in producer's list
+        if (std::find(
+            args->assignedIDs.begin(), 
+            args->assignedIDs.end(), 
+            entry.trafficLightID) == args -> assignedIDs.end()) {
+                continue;
+            }
+        
         // only enqueue if timestamp matches simulation time :)
         args->clock->simSleepUntil(entry.seconds);
 
         args->buffer->enqueue(entry);
-        std::cout << "Enqueue at sim t=" << args->clock->simNow().count() << "s\n";
+
+        std::cout << "Enqueue: " << entry.trafficLightID << std::endl;
     }
     return nullptr;
 }
@@ -252,15 +259,19 @@ void* ConsumerTask(void* threadArgs) {
 
 
 int main() { // act as timer thread
-    std::string fileName = "traffic_6h_random.csv";
+    std::string fileName = "output.csv";
     std::vector<TrafficLightData> data = readFromCSV(fileName);
     Buffer buffer {1};
     SortedTrafficList list{3}; // shows top 3
     SimulationClock clock{std::chrono::seconds {10 * 3600}, 60.0}; // start at 10am and run at 60x
 
-    int numProducers = 4;
+    int numProducers = 3;
     int numTrafficLights = 4;
     int numConsumers = 2;
+
+    // calculate how many Traffic Light ID's each producer should watch
+    int base = numTrafficLights / numProducers;
+    int remainder = numTrafficLights % numProducers;
 
     std::vector<pthread_t> producers(numProducers);
     std::vector<ProducerArgs> producerArgs(numProducers);
@@ -268,14 +279,28 @@ int main() { // act as timer thread
     std::vector<pthread_t> consumers(numConsumers);
     std::vector<ConsumerArgs> consumerArgs(numConsumers);
 
+    int start = 0;
     for (int i = 0; i < numProducers; i++) {
-        producerArgs[i] = {&data, i + 1, &buffer, &clock};
+        int numIDs = base + (i < remainder ? 1 : 0);
+
+        std::vector<int> ids; 
+        ids.reserve(numIDs);
+
+        for (int j = 0; j < numIDs; j++) {
+            ids.push_back(start + j); // 0 based ID's
+        }
+
+        start += numIDs;
+
+        producerArgs[i] = {&data, ids, &buffer, &clock};
         pthread_create(&producers[i], nullptr, ProducerTask, &producerArgs[i]);
+        pthread_detach(producers[i]);
     }
 
     for (int i = 0; i < numConsumers; i++) {
         consumerArgs[i] = {&buffer, &list, 3, &clock};
         pthread_create(&consumers[i], nullptr, ConsumerTask, &consumerArgs[i]);
+        pthread_detach(consumers[i]);
     }
 
     std::cout << "Program Starting" << std::endl;
@@ -286,7 +311,7 @@ int main() { // act as timer thread
         TrafficLightData signalReport {
             true,
             std::chrono::seconds {0},
-            1, // system will at least have 1 traffic light
+            -1, // arbitrary traffic light ID
             0 // adding 0 will not affect report
         };
 
