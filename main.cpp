@@ -1,63 +1,11 @@
 #include <iostream>
-
 #include <fstream>
 #include <sstream>
 #include <vector>
 #include <string>
-
 #include <pthread.h>
-
 #include <chrono>
-
 #include <thread>
-
-class SimulationClock {
-private: 
-    std::chrono::steady_clock::time_point realStart;
-    std::chrono::seconds simOffset; // 3600 (10 hrs)
-    double speedup; // 60.0 means 1 real seconds = 60 sim secs
-
-public:
-    SimulationClock(std::chrono::seconds simOffset, double speedup) {
-        this->realStart = std::chrono::steady_clock::now();
-        this->simOffset = simOffset;
-        this->speedup = speedup;
-    }
-
-    std::chrono::seconds simNow() {
-        auto realElapsed = std::chrono::steady_clock::now() - realStart;
-        auto simElapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::duration<double>(realElapsed) * speedup);
-        return simOffset + simElapsed;
-    }
-
-    void simSleepUntil(std::chrono::seconds target) {
-        std::chrono::seconds cur = simNow();
-        if (target <= cur) return;
-        // compute required real sleep using inverse of speed
-        auto sim_wait = target - cur;
-        auto real_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::duration<double>(sim_wait.count() / speedup)
-        );
-        std::this_thread::sleep_for(real_wait);
-    }
-
-    int simGetCurHour() {
-        int now = std::chrono::duration_cast<std::chrono::hours>(simNow()).count() % 24;
-        return now;
-    }
-
-    int simGetHourFromSecs(std::chrono::seconds seconds) {
-        int hour = std::chrono::duration_cast<std::chrono::hours>(seconds).count() % 24;
-        return hour;
-    }
-};
-
-struct TrafficLightData {
-    bool signalReport;
-    std::chrono::seconds seconds;
-    int trafficLightID;
-    int carsPassed;
-};
 
 static inline bool parse_hms_to_seconds(const std::string& s, std::chrono::seconds& out) {
     int H=0, M=0, S=0; char c1=':', c2=':';
@@ -67,6 +15,54 @@ static inline bool parse_hms_to_seconds(const std::string& s, std::chrono::secon
     out = std::chrono::hours(H) + std::chrono::minutes(M) + std::chrono::seconds(S);
     return true;
 }
+
+class SimulationClock {
+    private: 
+        std::chrono::steady_clock::time_point realStart;
+        std::chrono::seconds simOffset; // 3600 (10 hrs)
+        double speedup; // 60.0 means 1 real seconds = 60 sim secs
+
+    public:
+        SimulationClock(std::chrono::seconds simOffset, double speedup) {
+            this->realStart = std::chrono::steady_clock::now();
+            this->simOffset = simOffset;
+            this->speedup = speedup;
+        }
+
+        std::chrono::seconds simNow() {
+            auto realElapsed = std::chrono::steady_clock::now() - realStart;
+            auto simElapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::duration<double>(realElapsed) * speedup);
+            return simOffset + simElapsed;
+        }
+
+        void simSleepUntil(std::chrono::seconds target) {
+            std::chrono::seconds cur = simNow();
+            if (target <= cur) return;
+            // compute required real sleep using inverse of speed
+            auto sim_wait = target - cur;
+            auto real_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::duration<double>(sim_wait.count() / speedup)
+            );
+            std::this_thread::sleep_for(real_wait);
+        }
+
+        int simGetCurHour() {
+            int now = std::chrono::duration_cast<std::chrono::hours>(simNow()).count() % 24;
+            return now;
+        }
+
+        int simGetHourFromSecs(std::chrono::seconds seconds) {
+            int hour = std::chrono::duration_cast<std::chrono::hours>(seconds).count() % 24;
+            return hour;
+        }
+    };
+
+struct TrafficLightData {
+    bool signalReport;
+    std::chrono::seconds seconds;
+    int trafficLightID;
+    int carsPassed;
+};
 
 std::vector<TrafficLightData> readFromCSV(std::string fileName) {
     /*
@@ -109,6 +105,7 @@ std::vector<TrafficLightData> readFromCSV(std::string fileName) {
     return allData;
 }
 
+// Bounded Buffer
 class Buffer {
     private:
         std::queue<TrafficLightData> queue;
@@ -155,6 +152,7 @@ class Buffer {
         }
 };
 
+// Consumers
 class SortedTrafficList {
     private:
         int topN;
@@ -204,6 +202,30 @@ class SortedTrafficList {
         }
 };
 
+struct ConsumerArgs {
+    Buffer* buffer;
+    SortedTrafficList* list;
+    int n;
+    SimulationClock* clock;
+};
+
+void* ConsumerTask(void* threadArgs) {
+    auto* args = static_cast<ConsumerArgs*>(threadArgs);
+    TrafficLightData entry; // process an entry at a time
+
+    while (true) {
+        entry = args->buffer->dequeue();
+
+        if (entry.signalReport == true) {
+            args->list->report();
+            continue; // no need to add it
+        }
+
+        args->list->add(entry);
+    }
+};
+
+// Producers
 struct ProducerArgs {
     std::vector<TrafficLightData>* data;
     std::vector<int> assignedIDs;
@@ -233,29 +255,6 @@ void* ProducerTask(void* threadArgs) {
     }
     return nullptr;
 }
-
-struct ConsumerArgs {
-    Buffer* buffer;
-    SortedTrafficList* list;
-    int n;
-    SimulationClock* clock;
-};
-
-void* ConsumerTask(void* threadArgs) {
-    auto* args = static_cast<ConsumerArgs*>(threadArgs);
-    TrafficLightData entry; // process an entry at a time
-
-    while (true) {
-        entry = args->buffer->dequeue();
-
-        if (entry.signalReport == true) {
-            args->list->report();
-            continue; // no need to add it
-        }
-
-        args->list->add(entry);
-    }
-};
 
 
 int main() { // act as timer thread
