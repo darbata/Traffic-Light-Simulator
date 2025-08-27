@@ -257,44 +257,50 @@ void* ProducerTask(void* threadArgs) {
 }
 
 
+// main
+std::vector<std::vector<int>> partitionIDs(int total, int parts) {
+    // traffic light IDs expected to be 0 based
+    std::vector<std::vector<int>> partitions(parts);
+    const int base = total / parts;
+    const int remainder = total % parts;
+    int start = 0;
+    for (int i = 0; i < parts; i++) {
+        int count = base + (i < remainder ? 1 : 0);
+        partitions[i].reserve(count);
+        for (int j = 0; j < count; j++) {
+            partitions[i].push_back(start + j);
+        }
+        start += count;
+    }
+    return partitions;
+}
+
+
 int main() { // act as timer thread
-    std::string fileName = "output.csv";
+    int numProducers = 3;
+    int numTrafficLights = 4;
+    int numConsumers = 2;
+
+    const std::string fileName = "output.csv";
     std::vector<TrafficLightData> data = readFromCSV(fileName);
     Buffer buffer {1};
     SortedTrafficList list{3}; // shows top 3
     SimulationClock clock{std::chrono::seconds {10 * 3600}, 60.0}; // start at 10am and run at 60x
 
-    int numProducers = 3;
-    int numTrafficLights = 4;
-    int numConsumers = 2;
-
-    // calculate how many Traffic Light ID's each producer should watch
-    int base = numTrafficLights / numProducers;
-    int remainder = numTrafficLights % numProducers;
-
+    // create producers
+    const auto idPartitions = partitionIDs(numTrafficLights, numProducers);
     std::vector<pthread_t> producers(numProducers);
     std::vector<ProducerArgs> producerArgs(numProducers);
 
-    std::vector<pthread_t> consumers(numConsumers);
-    std::vector<ConsumerArgs> consumerArgs(numConsumers);
-
-    int start = 0;
     for (int i = 0; i < numProducers; i++) {
-        int numIDs = base + (i < remainder ? 1 : 0);
-
-        std::vector<int> ids; 
-        ids.reserve(numIDs);
-
-        for (int j = 0; j < numIDs; j++) {
-            ids.push_back(start + j); // 0 based ID's
-        }
-
-        start += numIDs;
-
-        producerArgs[i] = {&data, ids, &buffer, &clock};
+        producerArgs[i] = {&data, idPartitions[i], &buffer, &clock};
         pthread_create(&producers[i], nullptr, ProducerTask, &producerArgs[i]);
         pthread_detach(producers[i]);
     }
+
+    // create consumers
+    std::vector<pthread_t> consumers(numConsumers);
+    std::vector<ConsumerArgs> consumerArgs(numConsumers);
 
     for (int i = 0; i < numConsumers; i++) {
         consumerArgs[i] = {&buffer, &list, 3, &clock};
@@ -305,17 +311,11 @@ int main() { // act as timer thread
     std::cout << "Program Starting" << std::endl;
 
     while(true) {
+        // call to create a report every hour
         std::this_thread::sleep_for(std::chrono::seconds(60));
-
-        TrafficLightData signalReport {
-            true,
-            std::chrono::seconds {0},
-            -1, // arbitrary traffic light ID
-            0 // adding 0 will not affect report
-        };
-
-        std::cout << "Enqueued Report Signal" << std::endl;
-
+        bool createReport = true;
+        // only value that matters is createReport
+        TrafficLightData signalReport {createReport, std::chrono::seconds {0}, -1, 0}; 
         buffer.enqueue(signalReport);
     }
 
